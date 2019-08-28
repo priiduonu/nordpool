@@ -150,8 +150,19 @@ def setup(hass, config) -> bool:
     return True
 
 
+async def listen(hass, config_entry):
+    #hass.config_entries.async_update_entry(self.config_entry, options=options)
+    _LOGGER.info('listen called')
+    pass
+    # WTF
+
 async def async_setup_entry(hass, config_entry):
     """Set up nordpool as config entry."""
+
+    # Add some listener for config updates.
+    config_entry.add_update_listener(listen)
+
+
     hass.async_create_task(
         hass.config_entries.async_forward_entry_setup(config_entry, "sensor")
     )

@@ -72,14 +72,22 @@ class NordpoolOptionsHandler(config_entries.OptionsFlow):
     async def async_step_init(self, user_input=None):
         _LOGGER.info("user input %r" % user_input)
 
-        _LOGGER.info('%r' % dict(self.config_entry.options))
-        _LOGGER.info('%r' % dict(self.config_entry.data))
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+        #_LOGGER.info('options %r' % dict(self.config_entry.options))
+        #_LOGGER.info('data %r' % dict(self.config_entry.data))
 
         old_settings = self.config_entry.data
-        # for k, v in self.options.items():
-        #     _LOGGER.info('%s %s', k, v)
+
+        if user_input is not None:
+            _LOGGER.info('shit isnt none')
+            if user_input != old_settings:
+                # There some stuff that are changed.
+                user_input = old_settings.update(user_input)
+            else:
+                _LOGGER.info('didnt update settings as they where the same as the old one.')
+
+            if user_input:
+                _LOGGER.info('should have created new entry')
+                return self.async_create_entry(title="", data=user_input)
 
         return self.async_show_form(
             step_id="init",
@@ -115,5 +123,7 @@ class NordpoolOptionsHandler(config_entries.OptionsFlow):
         )
 
     async def _show_config_form(self, user_input=None):
+        pass
         # https://github.com/thomasloven/hass-favicon/blob/master/custom_components/favicon/__init__.py#L25
         #
+        # hass.config_entries.async_update_entry(self.config_entry, options=options)
