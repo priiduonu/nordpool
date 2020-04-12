@@ -2,21 +2,20 @@ import logging
 import math
 from operator import itemgetter
 
+import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 from homeassistant.components.sensor import PLATFORM_SCHEMA
 from homeassistant.const import CONF_REGION
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
-import pendulum
+from homeassistant.util import dt as dt_utils
 
 from . import DOMAIN
-from .misc import is_new, has_junk, extract_attrs
-
+from .misc import extract_attrs, has_junk, is_new, start_of
 
 _LOGGER = logging.getLogger(__name__)
 
-
-_PRICE_IN = {"kWh": 1000, "MWh": 0, "W": 1000 * 1000}
+_CENT_MULTIPLIER = 100
+_PRICE_IN = {"kWh": 1000, "MWh": 0, "Wh": 1000 * 1000}
 _REGIONS = {
     "DK1": ["DKK", "Denmark", 0.25],
     "DK2": ["DKK", "Denmark", 0.25],
@@ -24,7 +23,7 @@ _REGIONS = {
     "EE": ["EUR", "Estonia", 0.20],
     "LT": ["EUR", "Lithuania", 0.21],
     "LV": ["EUR", "Latvia", 0.21],
-    "Oslo": ["NOK", "Norway", 0, 25],
+    "Oslo": ["NOK", "Norway", 0.25],
     "Kr.sand": ["NOK", "Norway", 0.25],
     "Bergen": ["NOK", "Norway", 0.25],
     "Molde": ["NOK", "Norway", 0.25],
@@ -40,6 +39,7 @@ _REGIONS = {
 
 # Needed incase a user wants the prices in non local currency
 _CURRENCY_TO_LOCAL = {"DKK": "Kr", "NOK": "Kr", "SEK": "Kr", "EUR": "€"}
+_CURRENTY_TO_CENTS = {"DKK": "Øre", "NOK": "Øre", "SEK": "Öre", "EUR": "c"}
 
 DEFAULT_CURRENCY = "NOK"
 DEFAULT_REGION = "Kr.sand"
@@ -54,19 +54,19 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional("friendly_name", default=""): cv.string,
         # This is only needed if you want the some area but want the prices in a non local currency
         vol.Optional("currency", default=""): cv.string,
-        vol.Optional("VAT", default=True): vol.Boolean,
+        vol.Optional("VAT", default=True):cv.boolean,
         vol.Optional("precision", default=3): cv.positive_int,
         vol.Optional("low_price_cutoff", default=1.0): cv.small_float,
         vol.Optional("price_type", default="kWh"): vol.In(list(_PRICE_IN.keys())),
+        vol.Optional("price_in_cents", default=False): cv.boolean,
     }
 )
 
 
 def setup_platform(hass, config, add_devices, discovery_info=None) -> None:
     """Setup the damn platform using yaml."""
-    _LOGGER.info("setup_platform %s", config)
-    _LOGGER.info("pendulum default timezone %s", pendulum.now().timezone_name)
-    _LOGGER.info("timezone set in ha %r", hass.config.time_zone)
+    _LOGGER.debug("Dumping config %r", config)
+    _LOGGER.debug("timezone set in ha %r", hass.config.time_zone)
     region = config.get(CONF_REGION)
     friendly_name = config.get("friendly_name")
     price_type = config.get("price_type")
@@ -74,6 +74,7 @@ def setup_platform(hass, config, add_devices, discovery_info=None) -> None:
     low_price_cutoff = config.get("low_price_cutoff")
     currency = config.get("currency")
     vat = config.get("VAT")
+    use_cents = config.get("price_in_cents")
     api = hass.data[DOMAIN]
     sensor = NordpoolSensor(
         friendly_name,
@@ -83,6 +84,7 @@ def setup_platform(hass, config, add_devices, discovery_info=None) -> None:
         low_price_cutoff,
         currency,
         vat,
+        use_cents,
         api,
     )
 
@@ -92,6 +94,8 @@ def setup_platform(hass, config, add_devices, discovery_info=None) -> None:
 async def async_setup_entry(hass, config_entry, async_add_devices):
     """Setup sensor platform for the ui"""
     config = config_entry.data
+    _LOGGER.debug("Dumping config %r", config)
+    _LOGGER.debug("timezone set in ha %r", hass.config.time_zone)
     region = config.get(CONF_REGION)
     friendly_name = config.get("friendly_name")
     price_type = config.get("price_type")
@@ -99,6 +103,7 @@ async def async_setup_entry(hass, config_entry, async_add_devices):
     low_price_cutoff = config.get("low_price_cutoff")
     currency = config.get("currency")
     vat = config.get("VAT")
+    use_cents = config.get("price_in_cents")
     api = hass.data[DOMAIN]
     sensor = NordpoolSensor(
         friendly_name,
@@ -108,6 +113,7 @@ async def async_setup_entry(hass, config_entry, async_add_devices):
         low_price_cutoff,
         currency,
         vat,
+        use_cents,
         api,
     )
     async_add_devices([sensor])
@@ -123,6 +129,7 @@ class NordpoolSensor(Entity):
         low_price_cutoff,
         currency,
         vat,
+        use_cents,
         api,
     ) -> None:
         self._friendly_name = friendly_name or "%s %s %s" % (
@@ -135,9 +142,10 @@ class NordpoolSensor(Entity):
         self._price_type = price_type
         self._precision = precision
         self._low_price_cutoff = low_price_cutoff
+        self._use_cents = use_cents
         self._api = api
 
-        if vat:
+        if vat is True:
             self._vat = _REGIONS[area][2]
         else:
             self._vat = 0
@@ -148,6 +156,7 @@ class NordpoolSensor(Entity):
         # Holds the data for today and morrow.
         self._data_today = None
         self._data_tomorrow = None
+        self._tomorrow_valid = None
 
         # Values for the day
         self._average = None
@@ -180,7 +189,11 @@ class NordpoolSensor(Entity):
     @property
     def unit_of_measurement(self) -> str:
         """Return the unit of measurement this sensor expresses itself in."""
-        return "%s/%s" % (self._currency, self._price_type)
+        _currency = self._currency
+        if self._use_cents is True:
+            # Convert unit of measurement to cents based on chosen currency
+            _currency = _CURRENTY_TO_CENTS[_currency]
+        return "%s/%s" % (_currency, self._price_type)
 
     @property
     def unique_id(self):
@@ -231,6 +244,10 @@ class NordpoolSensor(Entity):
         else:
             price = value / _PRICE_IN[self._price_type] * (float(1 + self._vat))
 
+        # Convert price to cents if specified by the user.
+        if self._use_cents:
+            price = price * _CENT_MULTIPLIER
+
         return round(price, self._precision)
 
     def _update(self, data) -> None:
@@ -262,13 +279,19 @@ class NordpoolSensor(Entity):
 
         # All the time in the api is returned in utc
         # convert this to local time.
-        tz = pendulum.now().timezone_name
+        #tz = pendulum.now().timezone_name
+        # ffs
         local_times = []
         for item in data.get("values", []):
+            #i = {
+            #    "start": pendulum.instance(item["start"]).in_timezone(tz),
+            #    "end": pendulum.instance(item["end"]).in_timezone(tz),
+            #    "value": item["value"],
+            #}
             i = {
-                "start": pendulum.instance(item["start"]).in_timezone(tz),
-                "end": pendulum.instance(item["end"]).in_timezone(tz),
-                "value": item["value"],
+                "start": dt_utils.as_local(item["start"]),
+                "end": dt_utils.as_local(item["end"]),
+                "value": item["value"]
             }
 
             local_times.append(i)
@@ -316,19 +339,20 @@ class NordpoolSensor(Entity):
             "country": _REGIONS[self._area][1],
             "region": self._area,
             "low price": self.low_price,
+            "tomorrow_valid": self._tomorrow_valid, 
             "today": self.today,
             "tomorrow": self.tomorrow,
         }
 
     def _update_current_price(self) -> None:
         """ update the current price (price this hour)"""
-        local_now = pendulum.now()
+        local_now = dt_utils.now()
 
         if self._last_update_hourly is None or is_new(self._last_update_hourly, "hour"):
             data = self._api.today(self._area, self._currency)
             if data:
                 for item in self._someday(data):
-                    if item["start"] == local_now.start_of("hour"):
+                    if item["start"] == start_of(local_now, "hour"):
                         self._current_price = item["value"]
                         self._last_update_hourly = local_now
                         _LOGGER.debug("Updated _current_price %s", item["value"])
@@ -343,7 +367,7 @@ class NordpoolSensor(Entity):
            in self._data_today and self._data_tomorrow.
         """
         if self._last_tick is None:
-            self._last_tick = pendulum.now()
+            self._last_tick = dt_utils.now()
 
         if self._data_today is None:
             _LOGGER.debug("NordpoolSensor _data_today is none, trying to fetch it.")
@@ -359,7 +383,7 @@ class NordpoolSensor(Entity):
                 self._data_tomorrow = tomorrow
 
         if is_new(self._last_tick, typ="day"):
-
+            
             # No need to update if we got the info we need
             if self._data_tomorrow is not None:
                 self._data_today = self._data_tomorrow
@@ -380,4 +404,6 @@ class NordpoolSensor(Entity):
         if tomorrow:
             self._data_tomorrow = tomorrow
 
-        self._last_tick = pendulum.now()
+        self._last_tick = dt_utils.now()
+        self._tomorrow_valid = self._api.tomorrow_valid()
+
